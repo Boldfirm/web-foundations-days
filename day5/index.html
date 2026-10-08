@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>User Directory</title>
+  <script src="users.js" defer></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 650px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      line-height: 1.5;
+    }
+    .controls {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .input-group {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    input, button {
+      padding: 0.5rem;
+      font-size: 1rem;
+    }
+    button {
+      cursor: pointer;
+      align-self: flex-start;
+    }
+    ul#users-list {
+      list-style-type: none;
+      padding: 0;
+    }
+    ul#users-list li {
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      padding: 0.75rem 1rem;
+      margin-bottom: 0.75rem;
+      background-color: #fafafa;
+    }
+    ul#users-list li strong {
+      display: block;
+      font-size: 1.1rem;
+      color: #222;
+    }
+    #status {
+      font-weight: 500;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+  <h1>User Directory</h1>
+
+  <div class="controls">
+    <button id="load-users">Load Users</button>
+
+    <div class="input-group">
+      <label for="filter-input">Filter by name:</label>
+      <input type="text" id="filter-input" placeholder="Type a name to filter..." />
+    </div>
+  </div>
+
+  <p id="status"></p>
+  <ul id="users-list"></ul>
+</body>
+</html>

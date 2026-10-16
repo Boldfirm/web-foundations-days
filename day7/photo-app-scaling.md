@@ -4,7 +4,7 @@
 * **Total Registered Users:** 10,000,000 (10 million).
 * **Daily Active Ratio:** 10% of registered users are active daily.
 * **Daily Active Users (DAU):** 
-  $$\text{DAU} = 10{,}000{,}000 \times 0.10 = 1{,}000{,}000\text{ users/day}$$
+  $$\text{DAU} = 10{,}000{,}000 \times 0.10 = 1{,}000{,}000\text{ active users/day}$$
 * **User Activity per Day:**
   * Each active user uploads **1 photo/day**.
   * Each active user views **50 feed pages/day**.
@@ -36,7 +36,7 @@
   $$500\text{ views/sec} \times 5 = 2{,}500\text{ views/sec}$$
 
 ### Photo Storage per Year
-* **Daily Raw Storage:** 
+* **Daily Storage Ingestion:** 
   $$1{,}000{,}000\text{ photos} \times 2.05\text{ MB} = 2{,}050{,}000\text{ MB/day} = 2.05\text{ TB/day}$$
 * **Annual Storage (365 days):** 
   $$2.05\text{ TB/day} \times 365\text{ days} \approx 748.25\text{ TB/year}$$
@@ -45,19 +45,19 @@
 
 ## 3. Workload Characterization: Read-Heavy vs. Write-Heavy
 * **Read-to-Write Ratio:** 
-  $$\frac{50{,}000{,}000\text{ feed reads}}{1{,}000{,}000\text{ photo writes}} = 50:1$$
+  $$\frac{50{,}000{,}000\text{ feed reads}}{1{,}000{,}000\text{ photo uploads}} = 50:1$$
 * **Verdict:** SnapShare is an overwhelmingly **read-heavy** system.
 * **Architectural Implications:** 
-  * The system must prioritize read optimization techniques, such as aggressive multi-layer caching (Redis) for home timelines and user feeds.
-  * Content Delivery Networks (CDNs) must be placed at the edge to offload media downloads from our origin infrastructure.
-  * Relational database writes can be funneled to a single primary database while read traffic is distributed across horizontal read replicas.
+  * The system must prioritize read optimization through aggressive in-memory caching (Redis) for timelines, follower graphs, and active user metadata.
+  * A Content Delivery Network (CDN) edge tier is required to offload media traffic from origin servers.
+  * Relational database writes are isolated to a single primary database, while read traffic is offloaded to horizontal read replicas.
 
 ---
 
 ## 4. Storage Strategy: Database vs. Object Storage
-Storing raw binary photos as BLOBs directly inside a relational database (PostgreSQL/MySQL) causes extreme disk bloat, exhausts RAM buffer pools, slows down indexing, and makes database backups and replication painfully slow. 
+Storing raw binary photos as BLOBs directly inside a relational database causes severe disk bloat, exhausts RAM buffer pools, slows down indexing, and makes database backups and replication impractical.
 
-Instead, binary media (original images and generated thumbnails) must be stored in dedicated **cloud object storage** (such as Amazon S3, Google Cloud Storage, or MinIO). The relational database stores only structured metadata, such as `photo_id`, `user_id`, `caption`, `created_at`, and the public object storage `image_url` string.
+Instead, binary media (original images and generated thumbnails) is stored in **cloud object storage** (such as Amazon S3 or Google Cloud Storage). The relational database stores only structured metadata, such as `photo_id`, `user_id`, `caption`, `created_at`, and the public object storage `image_url` string.
 
 ---
 
@@ -73,23 +73,26 @@ Instead, binary media (original images and generated thumbnails) must be stored 
     │  CDN (Edge)  │                                │  Load Balancer  │
     └──────┬───────┘                                └────────┬────────┘
            │                                                 │
-           │ (origin fetch on miss)       ┌──────────────────┼──────────────────┐
-           ▼                              ▼                  ▼                  ▼
-    ┌──────────────┐               ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-    │Object Storage│               │App Server 1 │    │App Server 2 │    │App Server 3 │
-    │ (Amazon S3)  │               └──────┬──────┘    └──────┬──────┘    └──────┬──────┘
-    └──────▲───────┘                      │                  │                  │
-           │                              └───────────┬──────┴──────────────────┘
-           │                                          │
-           │ write thumbnails/photos                  ├─────────────────────────────────┐
-           │                                          ▼                                 ▼
-    ┌──────┴───────┐                         ┌─────────────────┐               ┌─────────────────┐
-    │ Worker Fleet │                         │ In-Memory Cache │               │ Primary Database│
-    │ (Thumbnailer)│                         │  (Redis / RAM)  │               │   (Postgres)    │
-    └──────▲───────┘                         └─────────────────┘               └────────┬────────┘
-           │ pull jobs                                                                  │
-    ┌──────┴───────┐                                                         Replication│ (WAL)
-    │Message Queue │                                                                    ▼
-    │(RabbitMQ/SQS)│◄────────── enqueue image processing jobs ──────────────── ┌─────────────────┐
-    └──────────────┘                                                           │  Read Replica   │
-                                                                               └─────────────────┘
+           │ (origin fetch on cache miss)                    │
+           ▼                                ┌────────────────┼────────────────┐
+    ┌──────────────┐                        ▼                ▼                ▼
+    │Object Storage│                 ┌─────────────┐  ┌─────────────┐  ┌─────────────┐
+    │ (Amazon S3)  │                 │App Server 1 │  │App Server 2 │  │App Server 3 │
+    └──────▲───────┘                 └──────┬──────┘  └──────┬──────┘  └──────┬──────┘
+           │                                │                │                │
+           │                                └────────┬───────┴────────────────┘
+           │                                         │
+           │                       ┌─────────────────┼─────────────────┐
+           │                       │ Reads / Inval.  │ Writes          │ Enqueue Jobs
+           │                       ▼                 ▼                 ▼
+           │              ┌─────────────────┐ ┌───────────────┐ ┌───────────────┐
+           │              │ In-Memory Cache │ │Primary Database│ │ Message Queue │
+           │              │     (Redis)     │ │ (PostgreSQL)  │ │(RabbitMQ/SQS) │
+           │              └─────────────────┘ └───────┬───────┘ └───────┬───────┘
+           │                                          │                 │
+           │ write thumbnails              Replication│ (WAL)   Consume │ Jobs
+           │                                          ▼                 ▼
+    ┌──────┴───────┐                         ┌─────────────────┐ ┌───────────────┐
+    │ Worker Fleet │                         │  Read Replica   │ │ Worker Fleet  │
+    │(Image Resizer)                         │  (Feed Queries) │ │ (Thumbnailer) │
+    └──────────────┘                         └─────────────────┘ └───────────────┘

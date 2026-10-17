@@ -85,7 +85,7 @@ CREATE TABLE reservations (
     expires_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     FOREIGN KEY (event_id, seat_id) REFERENCES seats(event_id, id),
-    UNIQUE (id, seat_id)
+    UNIQUE (id, seat_id, user_id)
 );
 
 CREATE UNIQUE INDEX one_active_hold_per_seat
@@ -100,7 +100,8 @@ CREATE TABLE tickets (
     purchased_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     price_paid_cents INTEGER NOT NULL CHECK (price_paid_cents >= 0),
     FOREIGN KEY (event_id, seat_id) REFERENCES seats(event_id, id),
-    FOREIGN KEY (reservation_id, seat_id) REFERENCES reservations(id, seat_id)
+    FOREIGN KEY (reservation_id, seat_id, user_id)
+        REFERENCES reservations(id, seat_id, user_id)
 );
 
 CREATE INDEX seats_by_event_idx ON seats (event_id, section, row_label, seat_number);
@@ -108,47 +109,26 @@ CREATE INDEX reservations_expiry_idx ON reservations (expires_at) WHERE status =
 CREATE INDEX tickets_by_user_event_idx ON tickets (user_id, event_id);
 ```
 
-The seat-position unique constraint prevents duplicate inventory rows. The partial unique index permits only one active hold per seat (expired/released holds remain as history). `tickets.seat_id UNIQUE` is the final guarantee that a seat cannot have two sales. Database transactions transition a hold to `sold` and create its ticket atomically. A scheduled expiry worker marks overdue holds `expired`; a hold is not considered reusable until the expiry transition is committed. Production payment integration should use an idempotent payment-provider request and reconcile uncertain payment outcomes before releasing inventory.
+The seat-position unique constraint prevents duplicate inventory rows. The partial unique index permits only one active hold per seat (expired/released holds remain as history). `tickets.seat_id UNIQUE` is the final guarantee that a seat cannot have two sales. The composite ticket-to-reservation foreign key also guarantees that a ticket's user is the reservation owner. Database transactions transition a hold to `sold` and create its ticket atomically. A scheduled expiry worker marks overdue holds `expired`; a hold is not considered reusable until the expiry transition is committed. Production payment integration should use an idempotent payment-provider request and reconcile uncertain payment outcomes before releasing inventory.
 
 ## 5. High-level architecture and component justifications
 
-```text
-                         ┌────────────────┐
-                         │ Web / Mobile   │
-                         │ Client         │
-                         └───────┬────────┘
-                                 │
-                         ┌───────▼────────┐
-                         │ DNS            │
-                         └───────┬────────┘
-                                 │
-                    ┌────────────▼─────────────┐
-                    │ CDN / WAF               │
-                    │ static assets, edge rules│
-                    └────────────┬─────────────┘
-                                 │ dynamic requests
-                    ┌────────────▼─────────────┐
-                    │ Virtual Waiting Room    │
-                    │ admission tokens / queue│
-                    └────────────┬─────────────┘
-                                 │ rate-limited admission
-                    ┌────────────▼─────────────┐
-                    │ Load Balancer            │
-                    └──────┬────────────┬─────┘
-                           │            │
-                 ┌─────────▼───┐  ┌─────▼────────┐
-                 │ App Server 1│  │ App Server 2 │  ...
-                 └─────┬───┬───┘  └──┬───────┬───┘
-                       │   │         │       │
-                  ┌────▼┐ ┌▼─────────▼┐   ┌─▼──────────┐
-                  │Redis│ │PostgreSQL │   │Message     │
-                  │holds│ │primary +  │   │Queue       │
-                  │cache│ │replica    │   └─────┬─────┘
-                  └─────┘ └───────────┘         │
-                                           ┌─────▼─────┐
-                                           │Workers    │
-                                           │expiry etc.│
-                                           └───────────┘
+```mermaid
+flowchart TD
+    Client[Web and mobile clients] --> DNS[DNS]
+    DNS --> CDN[CDN and WAF]
+    CDN --> Room[Virtual waiting room]
+    Room --> LB[Load balancer]
+    LB --> App1[App server 1]
+    LB --> App2[App server 2 and autoscaled peers]
+    App1 --> Redis[(Redis hold keys and read cache)]
+    App2 --> Redis
+    App1 --> Primary[(PostgreSQL primary)]
+    App2 --> Primary
+    Primary --> Replica[(PostgreSQL read replica)]
+    App1 --> Queue[[Durable message queue]]
+    App2 --> Queue
+    Queue --> Workers[Worker pool: expiry, payment reconciliation, notifications]
 ```
 
 - **CDN/WAF:** serves static files near users, absorbs cacheable traffic, and filters common edge threats before they reach the origin.
@@ -162,11 +142,21 @@ The seat-position unique constraint prevents duplicate inventory rows. The parti
 
 ## 6. Preventing two people from buying the same seat
 
-Redis is the fast-path admission guard; PostgreSQL is the source of truth. For a hold request, the application first attempts `SET seat:{seatId} {reservationToken} NX EX 300`. `NX` means the key is created only if absent, so one concurrent caller wins the five-minute hold and other callers receive an unavailable response. The token identifies the owner; release/expiry must compare the stored token before deleting it (a compare-and-delete Lua script), so an old request cannot clear a newer hold. Redis keys use a TTL to recover from abandoned clients. Redis failover or eviction can weaken this fast-path, so the database checks remain mandatory.
+The design uses three independent safeguards: a Redis fast path to reject most competing requests quickly, a PostgreSQL row lock to serialize authoritative state transitions, and a unique ticket constraint as the final invariant. Redis is not the source of truth.
 
-After acquiring the Redis key, the application opens a PostgreSQL transaction and selects the seat row with `SELECT ... FROM seats WHERE id = $1 FOR UPDATE`. The row lock serializes competing transactions for that seat. While holding the lock, it verifies the event is purchasable, confirms there is no ticket and no unexpired active reservation, then inserts the reservation and commits. If validation or insertion fails, it rolls back and releases only its own Redis token. Hold expiry/release also updates the database status transactionally before allowing another hold.
+### 6.1 Redis `SETNX` fast path
 
-During purchase, the payment provider authorizes payment with an idempotency key without holding a database lock. The service then opens a short transaction, locks the reservation/seat rows, and verifies the reservation belongs to the caller and is still active. It changes the reservation to `sold` and inserts the ticket atomically. If the hold expired or the transaction fails, the authorization is voided; after commit, capture/reconciliation is handled idempotently through the queue. The unique constraint `tickets(seat_id)` prevents a duplicate sale even if two requests race, a Redis key is lost, or application code has a defect; the losing transaction rolls back and returns `409 Conflict`. Row locks provide orderly conflict handling, while unique constraints are the final invariant. Redis state can be reconstructed from active reservations; it is never used as proof that a ticket was sold.
+For a hold request, the application first attempts `SET seat:{seatId} {reservationToken} NX EX 300`. `NX` means the key is created only if absent, so one concurrent caller wins the five-minute hold and other callers receive an unavailable response. The token identifies the owner; release/expiry must compare the stored token before deleting it (a compare-and-delete Lua script), so an old request cannot clear a newer hold. Redis keys use a TTL to recover from abandoned clients. Redis failover or eviction can weaken this fast path, so the database checks remain mandatory.
+
+### 6.2 PostgreSQL `SELECT FOR UPDATE`
+
+After acquiring the Redis key, the application opens a PostgreSQL transaction and selects the seat row with `SELECT ... FROM seats WHERE id = $1 FOR UPDATE`. The row lock serializes competing transactions for that seat. While holding the lock, it verifies the event is purchasable and checks for an existing ticket or active reservation. If a reservation is past `expires_at`, the transaction first marks it `expired`; only then does it insert a new `held` reservation and commit. If validation or insertion fails, it rolls back and releases only its own Redis token. Hold expiry/release also updates the database status transactionally before allowing another hold.
+
+During purchase, the payment provider authorizes payment with an idempotency key without holding a database lock. The service then opens a short transaction, locks the reservation/seat rows, and verifies the reservation belongs to the caller and is still active. It changes the reservation to `sold` and inserts the ticket atomically. If the hold expired or the transaction fails, the authorization is voided; after commit, capture/reconciliation is handled idempotently through the queue.
+
+### 6.3 Unique ticket constraint
+
+The unique constraint `tickets(seat_id)` prevents a duplicate sale even if two requests race, a Redis key is lost, or application code has a defect; the losing transaction rolls back and returns `409 Conflict`. Row locks provide orderly conflict handling, while unique constraints are the final invariant. Redis state can be reconstructed from active reservations; it is never used as proof that a ticket was sold.
 
 ### Two architectural trade-offs
 

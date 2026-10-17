@@ -11,9 +11,9 @@
 * **File Sizes:**
   * Average original photo size: **2 MB**.
   * Generated thumbnail size: **50 KB** (0.05 MB).
-  * Total binary storage per upload: $2\text{ MB} + 0.05\text{ MB} = 2.05\text{ MB}$.
+  * Total binary storage per upload: 2 MB + 0.05 MB = 2.05 MB.
 * **Time Conversion Approximation:** 1 day $\approx 100{,}000$ seconds.
-* **Traffic Multiplier:** Peak traffic is estimated at **$5\times$** average traffic.
+* **Traffic Multiplier:** Peak traffic is estimated at **5x** average traffic.
 
 ---
 
@@ -24,7 +24,7 @@
   $$1{,}000{,}000\text{ active users} \times 1\text{ photo/day} = 1{,}000{,}000\text{ uploads/day}$$
 * **Average Uploads/sec:** 
   $$\frac{1{,}000{,}000\text{ uploads}}{100{,}000\text{ seconds}} = 10\text{ uploads/sec}$$
-* **Peak Uploads/sec ($5\times$):** 
+* **Peak Uploads/sec (5x):** 
   $$10\text{ uploads/sec} \times 5 = 50\text{ uploads/sec}$$
 
 ### Feed Views per Second (Reads)
@@ -32,7 +32,7 @@
   $$1{,}000{,}000\text{ active users} \times 50\text{ views/day} = 50{,}000{,}000\text{ views/day}$$
 * **Average Feed Views/sec:** 
   $$\frac{50{,}000{,}000\text{ views}}{100{,}000\text{ seconds}} = 500\text{ views/sec}$$
-* **Peak Feed Views/sec ($5\times$):** 
+* **Peak Feed Views/sec (5x):** 
   $$500\text{ views/sec} \times 5 = 2{,}500\text{ views/sec}$$
 
 ### Photo Storage per Year
